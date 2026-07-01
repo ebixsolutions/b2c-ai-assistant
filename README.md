@@ -25,9 +25,20 @@ pip --version                                   # confirm pip is available
 4. python -m venv .venv                          # create virtual env
 5. .venv\Scripts\activate.bat                    # cmd     (PowerShell: .\.venv\Scripts\Activate.ps1)
 6. pip install -r requirements.txt               # install deps
-7. python run.py                                 # start the server
-8. open http://127.0.0.1:8000/                   # check the API is running
+7. run the SQL setup scripts                     # create + seed tables (see below)
+8. python run.py                                 # start the server
+9. open http://127.0.0.1:8000/                   # check the API is running
 ```
+
+**Step 7 — run the SQL setup scripts.** Create and seed the tables the API needs.
+Run both files against your `b2c-v1` DB (uses the same creds you set in `.env`):
+
+```
+psql -h <hostname> -U <username> -d <database_name> -f sql/rules_table.sql
+psql -h <hostname> -U <username> -d <database_name> -f sql/top_view_ai_creation_logs.sql
+```
+> `rules_table.sql` creates + upserts the `rules_tags` seed rows; `top_view_ai_creation_logs.sql`
+> creates the video-creation log table. Both are safe to re-run.
 
 ---
 
