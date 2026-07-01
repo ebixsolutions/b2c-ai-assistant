@@ -7,6 +7,21 @@ Runs on **port 8000**.
 
 ---
 
+## ⚡ Quick setup
+
+```
+1. cd b2c-ai-assistant                          # open the project folder
+2. copy .env.example .env                       # then edit DB creds, topview creds, etc.
+3. add google-credentials.json                  # place in this folder 
+4. python -m venv .venv                          # create virtual env
+5. .venv\Scripts\activate.bat                    # cmd     (PowerShell: .\.venv\Scripts\Activate.ps1)
+6. pip install -r requirements.txt               # install deps
+7. python run.py                                 # start the server
+8. open http://127.0.0.1:8000/                   # check the API is running
+```
+
+---
+
 ## Step-by-step run
 
 ### Step 1 — open a terminal in this folder
