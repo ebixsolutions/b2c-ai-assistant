@@ -9,6 +9,15 @@ Runs on **port 8000**.
 
 ## ⚡ Quick setup
 
+**Requires Python 3.10+.** Install from [python.org/downloads](https://www.python.org/downloads/)
+(on Windows, tick **"Add python.exe to PATH"** in the installer), then confirm:
+
+```
+python --version                                # should print Python 3.10 or higher
+pip --version                                   # confirm pip is available
+```
+> If `python` isn't found on Windows, try `py --version`. On macOS / Linux use `python3 --version`.
+
 ```
 1. cd b2c-ai-assistant                          # open the project folder
 2. copy .env.example .env                       # then edit DB creds, topview creds, etc.
