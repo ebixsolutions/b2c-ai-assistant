@@ -55,6 +55,16 @@ def generate_banner(body: dict):
     return ai_video_controller.generate_banner(body)
 
 
+@router.post("/generate_banner_submit")
+def generate_banner_submit(body: dict):
+    return ai_video_controller.generate_banner_submit(body)
+
+
+@router.post("/banner_task_status")
+def get_banner_task_status(body: dict):
+    return ai_video_controller.get_banner_task_status(body)
+
+
 @router.post("/download_proxy")
 def download_proxy(body: dict):
     return ai_video_controller.download_proxy(

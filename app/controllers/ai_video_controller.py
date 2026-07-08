@@ -142,7 +142,6 @@ def generate(params: dict) -> dict:
                 logo_file_id = logo_ids[0]
                 logger.info("Logo uploaded: %s", logo_file_id)
 
-        import os
         duration            = int(os.getenv("AI_VIDEO_DEFAULT_DURATION", "5"))
         input_video_file_id = (params.get("input_video_file_id") or "").strip()
 
@@ -394,118 +393,249 @@ def identify_segments(params: dict) -> dict:
         return _err("Segment identification failed. Please try again.")
 
 
-def generate_banner(params: dict) -> dict:
-    """POST /ai_video/generate_banner — full banner pipeline: frame → Gemini → TopView GPT Image 2."""
-    try:
-        mode     = params.get("mode", "generate")
-        logo_b64 = (params.get("logo_image_base64") or "").strip()
+def _resolve_banner_frame(params: dict) -> dict:
+    """Steps 1-2 of the banner pipeline: pick the frame + build the GPT Image 2 prompt.
 
-        edit_prompt = None
-        best_frame  = None
-        text_specs  = None
+    Returns {"ok": True, "edit_prompt", "best_frame", "text_specs", "preview": {...}|None}
+    or {"ok": False, "err": "..."}. Shared by the legacy blocking generate_banner() and the
+    non-blocking generate_banner_submit().
+    """
+    mode     = params.get("mode", "generate")
+    logo_b64 = (params.get("logo_image_base64") or "").strip()
 
-        # ── Precomputed path (batch winner from frontend) ──
-        precomputed_frame  = (params.get("precomputed_frame")  or "").strip()
-        precomputed_prompt = (params.get("precomputed_prompt") or "").strip()
-        precomputed_specs  = params.get("precomputed_text_specs")
-        if isinstance(precomputed_specs, str):
+    # ── Precomputed path (batch winner from frontend) ──
+    precomputed_frame  = (params.get("precomputed_frame")  or "").strip()
+    precomputed_prompt = (params.get("precomputed_prompt") or "").strip()
+    precomputed_specs  = params.get("precomputed_text_specs")
+    if isinstance(precomputed_specs, str):
+        try:
+            precomputed_specs = json.loads(precomputed_specs)
+        except Exception:
+            precomputed_specs = None
+
+    if precomputed_frame and precomputed_prompt:
+        logger.info("Banner: using precomputed batch-winner frame + prompt (skipping Gemini)")
+        return {
+            "ok":          True,
+            "edit_prompt": precomputed_prompt,
+            "best_frame":  precomputed_frame,
+            "text_specs":  precomputed_specs,
+            "preview":     None,
+        }
+
+    # ── Step 1: collect video frames ──
+    video_frames = []
+    frames_raw   = params.get("video_frames", [])
+    if isinstance(frames_raw, str):
+        try:
+            frames_raw = json.loads(frames_raw)
+        except Exception:
+            frames_raw = []
+    for f in (frames_raw or []):
+        if f:
+            video_frames.append(f)
+
+    contact_sheet = (params.get("contact_sheet") or "").strip()
+
+    # Fallback: download cover thumbnail
+    if not video_frames:
+        cover_url = (params.get("cover_url") or "").strip()
+        if cover_url:
             try:
-                precomputed_specs = json.loads(precomputed_specs)
+                resp = requests.get(
+                    cover_url, timeout=30, verify=False,
+                    headers={"User-Agent": "Mozilla/5.0"},
+                    allow_redirects=True,
+                )
+                if 200 <= resp.status_code < 300 and resp.content:
+                    img_b64 = "data:image/jpeg;base64," + base64.b64encode(resp.content).decode()
+                    video_frames.append(img_b64)
+                    contact_sheet = img_b64
+            except Exception as e:
+                logger.error("Banner: cover download failed: %s", e)
+
+    if not video_frames or not contact_sheet:
+        return {"ok": False, "err": "No video frames available — please generate a video first"}
+
+    logger.info("Banner frames: %d | mode: %s", len(video_frames), mode)
+
+    # ── Step 2: Gemini picks best cell + writes GPT Image 2 prompt ──
+    prompt_result = gemini_service.build_banner_imagen_prompt({
+        "contact_sheet":       contact_sheet,
+        "frame_count":         len(video_frames),
+        "category":            params.get("category", "General Advertising"),
+        "ad_style":            params.get("ad_style", ""),
+        "has_logo":            bool(logo_b64),
+        "is_product_fallback": bool(params.get("is_product_fallback")),
+    })
+    log_service.update_log_banner_picker(
+        params.get("log_id"),
+        total_tokens=(prompt_result.get("usage") or {}).get("total_tokens"),
+        status="success" if prompt_result["code"] == 0 else "error",
+        error_message=None if prompt_result["code"] == 0 else prompt_result.get("msg"),
+    )
+    if prompt_result["code"] != 0:
+        return {"ok": False, "err": f"Banner prompt failed: {prompt_result['msg']}"}
+
+    edit_prompt     = prompt_result["imagen_prompt"]
+    best_idx        = int(prompt_result.get("best_frame_index") or 0)
+    best_frame      = (
+        video_frames[best_idx]
+        if 0 <= best_idx < len(video_frames)
+        else video_frames[len(video_frames) // 2]
+    )
+    text_specs      = prompt_result.get("text_specs")
+    quality         = prompt_result.get("quality", "none")
+    person_visible  = prompt_result.get("person_visible", True)
+    product_visible = prompt_result.get("product_visible", True)
+
+    logger.info(
+        "Banner frame #%d | quality: %s | person: %s | product: %s | mode: %s",
+        best_idx, quality,
+        "yes" if person_visible else "NO",
+        "yes" if product_visible else "NO",
+        mode,
+    )
+
+    return {
+        "ok":          True,
+        "edit_prompt": edit_prompt,
+        "best_frame":  best_frame,
+        "text_specs":  text_specs,
+        "preview": {
+            "quality":          quality,
+            "best_frame_score": prompt_result.get("best_frame_score"),
+            "person_visible":   person_visible,
+            "product_visible":  product_visible,
+            "best_frame_index": best_idx,
+            "usage":            prompt_result.get("usage"),
+        },
+    }
+
+
+def _submit_banner_edit_task(log_id, best_frame: str, edit_prompt: str, logo_b64: str) -> dict:
+    """Steps 3-5: upload frame (+ optional logo), submit ONE TopView GPT Image 2 task.
+
+    Returns {"ok": True, "task_id": ...} or {"ok": False, "err": "..."}. Never polls —
+    callers decide how/when to check status, which is what keeps this non-blocking.
+    """
+    frame_fmt, frame_binary = _decode_base64_image(best_frame)
+    frame_cred = topview_service.get_upload_credential(frame_fmt)
+    if frame_cred["code"] != 0 or not (frame_cred.get("data") or {}).get("result", {}).get("uploadUrl"):
+        log_service.mark_stage_error(log_id, stage="banner", message="Failed to get upload credential for frame")
+        return {"ok": False, "err": "Failed to get upload credential for frame"}
+    frame_file_id = frame_cred["data"]["result"]["fileId"]
+    if not topview_service.upload_binary_to_s3(frame_cred["data"]["result"]["uploadUrl"], frame_binary):
+        log_service.mark_stage_error(log_id, stage="banner", message="Failed to upload frame to TopView")
+        return {"ok": False, "err": "Failed to upload frame to TopView"}
+    logger.info("Frame uploaded: %s", frame_file_id)
+
+    input_file_ids = [frame_file_id]
+
+    # Optional logo upload
+    if logo_b64:
+        logo_fmt, logo_binary = _decode_base64_image(logo_b64)
+        logo_cred = topview_service.get_upload_credential(logo_fmt)
+        if logo_cred["code"] == 0 and (logo_cred.get("data") or {}).get("result", {}).get("uploadUrl"):
+            logo_file_id = logo_cred["data"]["result"]["fileId"]
+            if topview_service.upload_binary_to_s3(logo_cred["data"]["result"]["uploadUrl"], logo_binary):
+                input_file_ids.append(logo_file_id)
+                logger.info("Logo uploaded: %s", logo_file_id)
+
+    edit_result = topview_service.image_edit_submit({
+        "model":             "GPT Image 2",
+        "prompt":            edit_prompt,
+        "inputImageFileIds": input_file_ids,
+        "aspectRatio":       "9:16",
+        "generateCount":     1,
+        "resolution":        "2K",
+        "inputFidelity":     "high",
+        "noticeUrl":         "",
+    })
+    if edit_result["code"] != 0:
+        log_service.mark_stage_error(log_id, stage="banner", message=f"Image edit submit failed: {edit_result['msg']}")
+        return {"ok": False, "err": f"Image edit submit failed: {edit_result['msg']}"}
+
+    inner_code = (edit_result.get("data") or {}).get("code", "200")
+    if str(inner_code) not in ("200", "0"):
+        msg = (edit_result.get("data") or {}).get("message") or f"Image edit submit failed (inner code {inner_code})"
+        logger.error("Image edit inner error: %s", edit_result.get("data"))
+        log_service.mark_stage_error(log_id, stage="banner", message=msg)
+        return {"ok": False, "err": msg}
+
+    data    = edit_result.get("data") or {}
+    res_obj = data.get("result") or data
+    task_id = res_obj.get("taskId") or data.get("taskId")
+    if not task_id:
+        logger.error("Image edit no taskId: %s", data)
+        log_service.mark_stage_error(log_id, stage="banner", message="No taskId returned from image edit")
+        return {"ok": False, "err": "No taskId returned from image edit"}
+    logger.info("Image edit taskId: %s", task_id)
+    return {"ok": True, "task_id": task_id}
+
+
+def _fetch_banner_data_url(banner_url: str):
+    """Step 7: fetch the generated banner and re-encode it as a JPEG data URL."""
+    try:
+        img_resp = requests.get(
+            banner_url,
+            timeout=30,
+            verify=False,
+            headers={"User-Agent": "Mozilla/5.0"},
+            allow_redirects=True,
+        )
+        if 200 <= img_resp.status_code < 300 and img_resp.content:
+            from PIL import Image
+            try:
+                img = Image.open(io.BytesIO(img_resp.content))
+                buf = io.BytesIO()
+                img.convert("RGB").save(buf, format="JPEG", quality=92)
+                return "data:image/jpeg;base64," + base64.b64encode(buf.getvalue()).decode()
             except Exception:
-                precomputed_specs = None
+                ct = (img_resp.headers.get("Content-Type") or "image/png").split(";")[0].strip().lower()
+                return f"data:{ct};base64," + base64.b64encode(img_resp.content).decode()
+    except Exception as e:
+        logger.error("Banner fetch/encode: %s", e)
+    return None
 
-        if precomputed_frame and precomputed_prompt:
-            edit_prompt = precomputed_prompt
-            best_frame  = precomputed_frame
-            text_specs  = precomputed_specs
-            logger.info("Banner: using precomputed batch-winner frame + prompt (skipping Gemini)")
-        else:
-            # ── Step 1: collect video frames ──
-            video_frames = []
-            frames_raw   = params.get("video_frames", [])
-            if isinstance(frames_raw, str):
-                try:
-                    frames_raw = json.loads(frames_raw)
-                except Exception:
-                    frames_raw = []
-            for f in (frames_raw or []):
-                if f:
-                    video_frames.append(f)
 
-            contact_sheet = (params.get("contact_sheet") or "").strip()
+def generate_banner(params: dict) -> dict:
+    """POST /ai_video/generate_banner — full banner pipeline: frame → Gemini → TopView GPT Image 2.
 
-            # Fallback: download cover thumbnail
-            if not video_frames:
-                cover_url = (params.get("cover_url") or "").strip()
-                if cover_url:
-                    try:
-                        resp = requests.get(
-                            cover_url, timeout=30, verify=False,
-                            headers={"User-Agent": "Mozilla/5.0"},
-                            allow_redirects=True,
-                        )
-                        if 200 <= resp.status_code < 300 and resp.content:
-                            img_b64 = "data:image/jpeg;base64," + base64.b64encode(resp.content).decode()
-                            video_frames.append(img_b64)
-                            contact_sheet = img_b64
-                    except Exception as e:
-                        logger.error("Banner: cover download failed: %s", e)
+    'preview' mode (per-batch frame scoring) is the only mode the current frontend still calls
+    directly — it's a single fast Gemini call, no TopView submit/poll involved.
 
-            if not video_frames or not contact_sheet:
-                return _err("No video frames available — please generate a video first")
+    The non-preview branch below is kept working for backward compatibility, but it blocks the
+    request for the full TopView submit+poll (+ safety-retry) cycle, which can take minutes.
+    New callers should use generate_banner_submit() + get_banner_task_status() instead, which
+    do the same work without holding a request open.
+    """
+    try:
+        mode = params.get("mode", "generate")
 
-            logger.info("Banner frames: %d | mode: %s", len(video_frames), mode)
+        resolved = _resolve_banner_frame(params)
+        if not resolved["ok"]:
+            return _err(resolved["err"])
 
-            # ── Step 2: Gemini picks best cell + writes GPT Image 2 prompt ──
-            prompt_result = gemini_service.build_banner_imagen_prompt({
-                "contact_sheet":       contact_sheet,
-                "frame_count":         len(video_frames),
-                "category":            params.get("category", "General Advertising"),
-                "ad_style":            params.get("ad_style", ""),
-                "has_logo":            bool(logo_b64),
-                "is_product_fallback": bool(params.get("is_product_fallback")),
+        edit_prompt = resolved["edit_prompt"]
+        best_frame  = resolved["best_frame"]
+        text_specs  = resolved["text_specs"]
+
+        if mode == "preview" and resolved.get("preview"):
+            p = resolved["preview"]
+            return _ok({
+                "quality":          p["quality"],
+                "best_frame_score": p["best_frame_score"],
+                "person_visible":   p["person_visible"],
+                "product_visible":  p["product_visible"],
+                "best_frame_index": p["best_frame_index"],
+                "frame_data":       best_frame,
+                "imagen_prompt":    edit_prompt,
+                "text_specs":       text_specs,
+                "usage":            p["usage"],
             })
-            log_service.update_log_banner_picker(
-                params.get("log_id"),
-                total_tokens=(prompt_result.get("usage") or {}).get("total_tokens"),
-                status="success" if prompt_result["code"] == 0 else "error",
-                error_message=None if prompt_result["code"] == 0 else prompt_result.get("msg"),
-            )
-            if prompt_result["code"] != 0:
-                return _err(f"Banner prompt failed: {prompt_result['msg']}")
 
-            edit_prompt     = prompt_result["imagen_prompt"]
-            best_idx        = int(prompt_result.get("best_frame_index") or 0)
-            best_frame      = (
-                video_frames[best_idx]
-                if 0 <= best_idx < len(video_frames)
-                else video_frames[len(video_frames) // 2]
-            )
-            text_specs      = prompt_result.get("text_specs")
-            quality         = prompt_result.get("quality", "none")
-            person_visible  = prompt_result.get("person_visible", True)
-            product_visible = prompt_result.get("product_visible", True)
-
-            logger.info(
-                "Banner frame #%d | quality: %s | person: %s | product: %s | mode: %s",
-                best_idx, quality,
-                "yes" if person_visible else "NO",
-                "yes" if product_visible else "NO",
-                mode,
-            )
-
-            if mode == "preview":
-                return _ok({
-                    "quality":          quality,
-                    "best_frame_score": prompt_result.get("best_frame_score"),
-                    "person_visible":   person_visible,
-                    "product_visible":  product_visible,
-                    "best_frame_index": best_idx,
-                    "frame_data":       best_frame,
-                    "imagen_prompt":    edit_prompt,
-                    "text_specs":       text_specs,
-                    "usage":            prompt_result.get("usage"),
-                })
+        logo_b64 = (params.get("logo_image_base64") or "").strip()
 
         # ── Steps 3-6: upload → submit → poll (with safety retry) ──
         banner_url = None
@@ -540,61 +670,10 @@ def generate_banner(params: dict) -> dict:
                     edit_prompt = rp["imagen_prompt"]
                     text_specs  = rp.get("text_specs") or text_specs
 
-            # Step 3: upload best frame
-            frame_fmt, frame_binary = _decode_base64_image(best_frame)
-            frame_cred = topview_service.get_upload_credential(frame_fmt)
-            if frame_cred["code"] != 0 or not (frame_cred.get("data") or {}).get("result", {}).get("uploadUrl"):
-                log_service.mark_stage_error(params.get("log_id"), stage="banner", message="Failed to get upload credential for frame")
-                return _err("Failed to get upload credential for frame")
-            frame_file_id = frame_cred["data"]["result"]["fileId"]
-            if not topview_service.upload_binary_to_s3(frame_cred["data"]["result"]["uploadUrl"], frame_binary):
-                log_service.mark_stage_error(params.get("log_id"), stage="banner", message="Failed to upload frame to TopView")
-                return _err("Failed to upload frame to TopView")
-            logger.info("Frame uploaded: %s%s", frame_file_id, " [retry]" if attempt > 0 else "")
-
-            input_file_ids = [frame_file_id]
-
-            # Step 4: upload logo (optional)
-            if logo_b64:
-                logo_fmt, logo_binary = _decode_base64_image(logo_b64)
-                logo_cred = topview_service.get_upload_credential(logo_fmt)
-                if logo_cred["code"] == 0 and (logo_cred.get("data") or {}).get("result", {}).get("uploadUrl"):
-                    logo_file_id = logo_cred["data"]["result"]["fileId"]
-                    if topview_service.upload_binary_to_s3(logo_cred["data"]["result"]["uploadUrl"], logo_binary):
-                        input_file_ids.append(logo_file_id)
-                        logger.info("Logo uploaded: %s", logo_file_id)
-
-            # Step 5: submit GPT Image 2 task
-            _edit_start = datetime.now(timezone.utc)
-            edit_result = topview_service.image_edit_submit({
-                "model":             "GPT Image 2",
-                "prompt":            edit_prompt,
-                "inputImageFileIds": input_file_ids,
-                "aspectRatio":       "9:16",
-                "generateCount":     1,
-                "resolution":        "2K",
-                "inputFidelity":     "high",
-                "noticeUrl":         "",
-            })
-            if edit_result["code"] != 0:
-                log_service.mark_stage_error(params.get("log_id"), stage="banner", message=f"Image edit submit failed: {edit_result['msg']}")
-                return _err(f"Image edit submit failed: {edit_result['msg']}")
-
-            inner_code = (edit_result.get("data") or {}).get("code", "200")
-            if str(inner_code) not in ("200", "0"):
-                msg = (edit_result.get("data") or {}).get("message") or f"Image edit submit failed (inner code {inner_code})"
-                logger.error("Image edit inner error: %s", edit_result.get("data"))
-                log_service.mark_stage_error(params.get("log_id"), stage="banner", message=msg)
-                return _err(msg)
-
-            data    = edit_result.get("data") or {}
-            res_obj = data.get("result") or data
-            task_id = res_obj.get("taskId") or data.get("taskId")
-            if not task_id:
-                logger.error("Image edit no taskId: %s", data)
-                log_service.mark_stage_error(params.get("log_id"), stage="banner", message="No taskId returned from image edit")
-                return _err("No taskId returned from image edit")
-            logger.info("Image edit taskId: %s", task_id)
+            submit_res = _submit_banner_edit_task(params.get("log_id"), best_frame, edit_prompt, logo_b64)
+            if not submit_res["ok"]:
+                return _err(submit_res["err"])
+            task_id = submit_res["task_id"]
 
             # Step 6: poll until done
             safety_triggered = False
@@ -672,28 +751,7 @@ def generate_banner(params: dict) -> dict:
 
         logger.info("Banner ready: %s", banner_url)
 
-        # Step 7: fetch binary and re-encode to JPEG data URL
-        banner_data_url = None
-        try:
-            img_resp = requests.get(
-                banner_url,
-                timeout=30,
-                verify=False,
-                headers={"User-Agent": "Mozilla/5.0"},
-                allow_redirects=True,
-            )
-            if 200 <= img_resp.status_code < 300 and img_resp.content:
-                from PIL import Image
-                try:
-                    img = Image.open(io.BytesIO(img_resp.content))
-                    buf = io.BytesIO()
-                    img.convert("RGB").save(buf, format="JPEG", quality=92)
-                    banner_data_url = "data:image/jpeg;base64," + base64.b64encode(buf.getvalue()).decode()
-                except Exception:
-                    ct   = (img_resp.headers.get("Content-Type") or "image/png").split(";")[0].strip().lower()
-                    banner_data_url = f"data:{ct};base64," + base64.b64encode(img_resp.content).decode()
-        except Exception as e:
-            logger.error("Banner fetch/encode: %s", e)
+        banner_data_url = _fetch_banner_data_url(banner_url)
 
         return _ok({
             "banner_url":      banner_url,
@@ -705,6 +763,172 @@ def generate_banner(params: dict) -> dict:
         logger.exception("generate_banner crashed")
         log_service.mark_stage_error(params.get("log_id"), stage="banner", message=f"Banner generation crashed: {exc}")
         return _err("Banner generation failed. Please try again.")
+
+
+def generate_banner_submit(params: dict) -> dict:
+    """POST /ai_video/generate_banner_submit — resolve frame + prompt, submit ONE TopView task.
+
+    Returns immediately with a taskId plus the retry metadata get_banner_task_status needs
+    to keep going (product fallbacks, current prompt/frame, log_id). No polling here — this
+    call finishes in a couple of seconds regardless of how long TopView takes to render.
+    """
+    try:
+        resolved = _resolve_banner_frame(params)
+        if not resolved["ok"]:
+            return _err(resolved["err"])
+
+        edit_prompt = resolved["edit_prompt"]
+        best_frame  = resolved["best_frame"]
+        text_specs  = resolved["text_specs"]
+        logo_b64    = (params.get("logo_image_base64") or "").strip()
+        log_id      = params.get("log_id")
+
+        product_fallbacks = list(dict.fromkeys(
+            v for v in [
+                params.get("product_image_base64",   ""),
+                params.get("product_image_base64_2", ""),
+                params.get("product_image_base64_3", ""),
+                params.get("product_image_base64_4", ""),
+            ] if v
+        ))
+
+        submit_res = _submit_banner_edit_task(log_id, best_frame, edit_prompt, logo_b64)
+        if not submit_res["ok"]:
+            return _err(submit_res["err"])
+
+        return _ok({
+            "status":            "processing",
+            "task_id":           submit_res["task_id"],
+            "attempt":           0,
+            "best_frame":        best_frame,
+            "edit_prompt":       edit_prompt,
+            "text_specs":        text_specs,
+            "product_fallbacks": product_fallbacks,
+            "logo_image_base64": logo_b64,
+            "category":          params.get("category", "General Advertising"),
+            "ad_style":          params.get("ad_style", ""),
+            "log_id":            log_id,
+        })
+
+    except Exception as exc:
+        logger.exception("generate_banner_submit crashed")
+        log_service.mark_stage_error(params.get("log_id"), stage="banner", message=f"Banner submit crashed: {exc}")
+        return _err("Banner generation failed. Please try again.")
+
+
+def get_banner_task_status(params: dict) -> dict:
+    """POST /ai_video/banner_task_status — check ONE TopView poll (no sleeping/looping).
+
+    On safety rejection with a fallback left, resubmits the next product image as a new
+    TopView task and returns status:'retrying' with updated meta — the frontend keeps
+    polling against the new task_id. On success, does the final fetch/re-encode. Each
+    call to this endpoint completes in well under a second beyond the TopView query itself.
+    """
+    try:
+        task_id = (params.get("task_id") or "").strip()
+        if not task_id:
+            return _err("task_id is required")
+
+        log_id            = params.get("log_id")
+        attempt           = int(params.get("attempt") or 0)
+        best_frame        = params.get("best_frame") or ""
+        edit_prompt       = params.get("edit_prompt") or ""
+        text_specs        = params.get("text_specs")
+        product_fallbacks = params.get("product_fallbacks") or []
+        logo_b64          = (params.get("logo_image_base64") or "").strip()
+        category          = params.get("category", "General Advertising")
+        ad_style          = params.get("ad_style", "")
+
+        poll = topview_service.image_edit_query(task_id)
+        if poll["code"] != 0:
+            return _ok({"status": "processing"})
+
+        r      = (poll.get("data") or {}).get("result") or poll.get("data") or {}
+        status = r.get("status", "")
+
+        if status == "success":
+            images = r.get("images") or r.get("outputImages") or r.get("videos") or []
+            banner_url = (
+                images[0].get("filePath")
+                or images[0].get("url")
+                or images[0].get("videoUrl")
+            ) if images else None
+            if not banner_url:
+                return _err("Banner task succeeded but returned no image")
+
+            cost_credit = r.get("costCredit")
+            log_service.update_log_banner_topview(
+                log_id,
+                banner_task_id=task_id,
+                banner_status="success",
+                banner_credits=float(cost_credit) if cost_credit is not None else None,
+            )
+            return _ok({
+                "status":          "success",
+                "banner_url":      banner_url,
+                "banner_data_url": _fetch_banner_data_url(banner_url),
+                "text_specs":      text_specs,
+            })
+
+        if status in ("fail", "failed", "error"):
+            raw_error = r.get("errorMsg") or r.get("message") or r.get("msg") or ""
+            logger.error("Banner poll failed: %s", r)
+            log_service.update_log_banner_topview(
+                log_id,
+                banner_task_id=task_id,
+                banner_status="error",
+                error_message=raw_error or "Banner generation failed (TopView returned an error)",
+            )
+            safety_triggered = any(kw in raw_error.lower() for kw in ("safety", "sexual", "rejected"))
+
+            if safety_triggered and attempt < len(product_fallbacks):
+                next_fb = product_fallbacks[attempt]
+                if next_fb and next_fb != best_frame:
+                    logger.info("Safety retry #%d: resubmitting with product fallback", attempt + 1)
+                    rp = gemini_service.build_banner_imagen_prompt({
+                        "contact_sheet":       next_fb,
+                        "frame_count":         1,
+                        "category":            category,
+                        "ad_style":            ad_style,
+                        "has_logo":            bool(logo_b64),
+                        "is_product_fallback": True,
+                    })
+                    new_prompt = rp["imagen_prompt"] if rp["code"] == 0 else edit_prompt
+                    new_specs  = rp.get("text_specs") if rp["code"] == 0 else text_specs
+
+                    submit_res = _submit_banner_edit_task(log_id, next_fb, new_prompt, logo_b64)
+                    if submit_res["ok"]:
+                        return _ok({
+                            "status":            "processing",
+                            "task_id":           submit_res["task_id"],
+                            "attempt":           attempt + 1,
+                            "best_frame":        next_fb,
+                            "edit_prompt":       new_prompt,
+                            "text_specs":        new_specs,
+                            "product_fallbacks": product_fallbacks,
+                            "logo_image_base64": logo_b64,
+                            "category":          category,
+                            "ad_style":          ad_style,
+                            "log_id":            log_id,
+                        })
+
+            if safety_triggered:
+                safety_msg = (
+                    "The selected frame was flagged by the safety filter and all product image fallbacks "
+                    "were also blocked. Please try a different product image or video."
+                )
+                log_service.update_log_banner_topview(
+                    log_id, banner_task_id=None, banner_status="error", error_message=safety_msg,
+                )
+                return _err(safety_msg)
+
+            return _err(raw_error or "Banner generation failed")
+
+        return _ok({"status": "processing"})
+
+    except Exception as exc:
+        logger.exception("get_banner_task_status crashed")
+        return _err(str(exc))
 
 
 def download_proxy(url: str, filename: str) -> Response:

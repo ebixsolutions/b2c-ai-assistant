@@ -509,6 +509,11 @@ def _call_gemini(prompt: str, images: list[str] | None = None):
             "temperature": 0.8,
             "maxOutputTokens": 8192,
             "responseMimeType": "application/json",
+            # These calls are single-pass extraction/classification (pick a frame, write a
+            # prompt, identify segments) — not multi-step reasoning. Extended thinking was
+            # measured burning ~5200 tokens (more than prompt+output combined) for ~35s per
+            # call with zero quality benefit for this task shape.
+            "thinkingConfig": {"thinkingBudget": 0},
         },
     }
 
